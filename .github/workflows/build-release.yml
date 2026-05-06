@@ -1,0 +1,138 @@
+# https://github.com/bero-sim/pdetarc-tools/blob/main/.github/workflows/build-release.yml
+name: Build and Release Tools with App Bundle
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# env:
+#   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.3'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            pyinstaller --onefile --icon=PDETARC_EXTRACT.ico pdetarc-extract.py
+          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+            pyinstaller --onefile --icon=PDETARC_EXTRACT.icns pdetarc-extract.py
+          else
+            pyinstaller --onefile pdetarc-extract.py
+          fi
+
+      - name: Post Build (Rename and Zip)
+        shell: bash
+        run: |
+          mkdir -p dist_zip
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            mv dist/pdetarc-extract.exe dist/pdetarc-extract-windows.exe
+            # Pythonを使用してOS依存なしにzip化
+            python -c "import shutil; shutil.make_archive('dist_zip/pdetarc-extract-windows-latest', 'zip', 'dist', 'pdetarc-extract-windows.exe')"
+          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+            mv dist/pdetarc-extract dist/pdetarc-extract-mac
+            python -c "import shutil; shutil.make_archive('dist_zip/pdetarc-extract-macos-latest', 'zip', 'dist', 'pdetarc-extract-mac')"
+          else
+            mv dist/pdetarc-extract dist/pdetarc-extract-linux
+            python -c "import shutil; shutil.make_archive('dist_zip/pdetarc-extract-ubuntu-latest', 'zip', 'dist', 'pdetarc-extract-linux')"
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}
+          path: dist_zip/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts (self binaries)
+        uses: actions/download-artifact@v4
+        with:
+          path: all-assets
+          merge-multiple: true
+
+      - name: Fetch external assets from pdetarc-docker-app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. 外部アセット用のディレクトリを作成してダウンロード
+          mkdir -p all-assets
+          gh release download v1.0.0 --repo bero-sim/pdetarc-docker-app --pattern "*" --dir all-assets
+
+          # 2. Toolsのソースコードをパッキング
+          # 出力先を ../（カレントディレクトリの外）に指定することで、スキャン中の干渉を防ぎます。
+          # --exclude で all-assets を除外しているのは正しいので維持します。
+          tar --sort=name --mtime='2026-01-01Z' --owner=0 --group=0 --numeric-owner \
+              --exclude='.git' \
+              --exclude='all-assets' \
+              -cvzf ../pdetarc-tools-source.tar.gz .
+          
+          # 3. 作成したソースファイルを all-assets 内に移動して戻す
+          mv ../pdetarc-tools-source.tar.gz all-assets/
+
+      - name: Generate unified bundle.toml
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          APP_REPO="bero-sim/pdetarc-docker-app"
+          APP_VERSION="v1.0.0"
+          
+          cd all-assets
+          echo "" > ../bundle.toml
+
+          # 現場所にある全アセット（zip, tar, tar.gz）をスキャン
+          for f in *.zip *.tar *.tar.gz; do
+            [ -e "$f" ] || continue
+            NAME=$(basename "$f")
+            SHA=$(sha256sum "$f" | awk '{print $1}')
+
+            # ファイル名から取得元のURLを判定
+            if [[ "$NAME" == *"pdetarc-docker-app"* ]] || [[ "$NAME" == *"pdetarc_image"* ]]; then
+              URL="https://github.com/${APP_REPO}/releases/download/${APP_VERSION}/${NAME}"
+            else
+              URL="https://github.com/${{ github.repository }}/releases/download/${VERSION}/${NAME}"
+            fi
+
+            echo "[[bundle]]" >> ../bundle.toml
+            echo "name = \"$NAME\"" >> ../bundle.toml
+            echo "file = \"$NAME\"" >> ../bundle.toml
+            echo "url = \"$URL\"" >> ../bundle.toml
+            echo "sha256 = \"$SHA\"" >> ../bundle.toml
+            echo "source = \"github-releases\"" >> ../bundle.toml
+            echo "" >> ../bundle.toml
+          done
+          cd ..
+
+      - name: Create Release and Upload All Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            all-assets/*.zip
+            all-assets/*.tar.gz
+            bundle.toml
+          generate_release_notes: true
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
